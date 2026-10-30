@@ -9,12 +9,12 @@ Run:      streamlit run nse_vp_scanner.py
 """
 
 import io
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 import yfinance as yf
 from plotly.subplots import make_subplots
 
@@ -25,14 +25,29 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 # ---------------------------------------------------------------- data
+LOCAL_LIST = Path(__file__).parent / "EQUITY_L.csv"
+
+
+def _parse_symbols(df: pd.DataFrame) -> list[str]:
+    df.columns = [c.strip() for c in df.columns]
+    df = df[df["SERIES"].astype(str).str.strip() == "EQ"]
+    return sorted(df["SYMBOL"].astype(str).str.strip().unique().tolist())
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def get_nse_symbols() -> list[str]:
-    r = requests.get(NSE_LIST_URL, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = [c.strip() for c in df.columns]
-    df = df[df["SERIES"].str.strip() == "EQ"]
-    return sorted(df["SYMBOL"].str.strip().unique().tolist())
+    """Try NSE live; if NSE blocks us (common on cloud servers), use EQUITY_L.csv from the repo."""
+    try:
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com/"})
+        r = sess.get(NSE_LIST_URL, timeout=10)
+        r.raise_for_status()
+        return _parse_symbols(pd.read_csv(io.StringIO(r.text)))
+    except Exception:
+        pass
+    if LOCAL_LIST.exists():
+        return _parse_symbols(pd.read_csv(LOCAL_LIST))
+    raise RuntimeError("NO_LIST")
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -118,7 +133,7 @@ def build_table(_prices: dict, key: int, lookback: int, bins: int, va_pct: float
 
 
 # --------------------------------------------------------------- chart
-def make_chart(sym: str, df: pd.DataFrame, lookback: int, bins: int, va_pct: float):
+def make_chart(sym: str, df: pd.DataFrame, lookback: int, bins: int, va_pct: float, height: int = 650):
     vp = volume_profile(df, lookback, bins, va_pct)
     d = df.tail(lookback)
 
@@ -152,7 +167,7 @@ def make_chart(sym: str, df: pd.DataFrame, lookback: int, bins: int, va_pct: flo
                       row=1, col=1)
 
     fig.update_layout(title=f"{sym} – last {lookback} days with volume profile",
-                      height=650, showlegend=False, margin=dict(l=10, r=10, t=50, b=10),
+                      height=height, showlegend=False, margin=dict(l=10, r=10, t=50, b=10),
                       xaxis_rangeslider_visible=False)
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], row=1, col=1)
     return fig
@@ -163,64 +178,6 @@ def tv_symbol(sym: str) -> str:
     # TradingView writes hyphens as underscores (BAJAJ-AUTO -> BAJAJ_AUTO)
     return "NSE:" + sym.replace("-", "_").replace("&", "_")
 
-
-def tv_widget(sym: str, height: int = 700):
-    html = f"""
-    <div style="height:{height}px;width:100%">
-      <div id="tv_chart" style="height:{height}px;width:100%"></div>
-      <script src="https://s3.tradingview.com/tv.js"></script>
-      <script>
-        new TradingView.widget({{
-          autosize: true, symbol: "{tv_symbol(sym)}", interval: "D",
-          timezone: "Asia/Kolkata", theme: "dark", style: "1", locale: "en",
-          enable_publishing: false, allow_symbol_change: true,
-          studies: ["Volume@tv-basicstudies", "VbPVisible@tv-volumebyprice"],
-          container_id: "tv_chart"
-        }});
-      </script>
-    </div>
-    """
-    components.html(html, height=height)
-
-
-def tv_grid(symbols: list, interval: str, vp: bool, cols: int, cell_h: int = 400):
-    """Grid of TradingView Advanced Chart widgets (same approach as the Forex Monitor)."""
-    import json
-    rows = -(-len(symbols) // cols)
-    cfg = {"symbols": [tv_symbol(x) for x in symbols], "interval": interval, "vp": vp}
-    html = """
-    <style>
-      body{margin:0;background:#0e1117}
-      .grid{display:grid;grid-template-columns:repeat(__COLS__,1fr);gap:6px}
-      .cell{height:__H__px;background:#131722;border:1px solid #2a2e39}
-      .tradingview-widget-container,.tradingview-widget-container__widget{width:100%;height:100%}
-    </style>
-    <div class="grid" id="g"></div>
-    <script>
-      const cfg = __CFG__;
-      cfg.symbols.forEach(sym => {
-        const cell = document.createElement("div"); cell.className = "cell";
-        const box = document.createElement("div"); box.className = "tradingview-widget-container";
-        const inner = document.createElement("div"); inner.className = "tradingview-widget-container__widget";
-        box.appendChild(inner);
-        const sc = document.createElement("script");
-        sc.src = "https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";
-        sc.async = true;
-        sc.innerHTML = JSON.stringify({
-          autosize: true, symbol: sym, interval: cfg.interval, timezone: "Asia/Kolkata",
-          theme: "dark", style: "1", locale: "en", allow_symbol_change: false,
-          studies: cfg.vp ? ["VbPVisible@tv-volumebyprice"] : [],
-          hide_side_toolbar: true, withdateranges: false, save_image: false,
-          support_host: "https://www.tradingview.com"
-        });
-        box.appendChild(sc); cell.appendChild(box);
-        document.getElementById("g").appendChild(cell);
-      });
-    </script>
-    """
-    html = (html.replace("__COLS__", str(cols)).replace("__H__", str(cell_h))
-                .replace("__CFG__", json.dumps(cfg)))
-    components.html(html, height=rows * (cell_h + 6) + 10, scrolling=True)
 
 
 # ------------------------------------------------------------------ UI
@@ -248,7 +205,12 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-symbols = get_nse_symbols()
+try:
+    symbols = get_nse_symbols()
+except RuntimeError:
+    st.error("Could not load the NSE stock list. Upload 'EQUITY_L.csv' (from "
+             "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv) to the app's GitHub repository.")
+    st.stop()
 st.caption(f"{len(symbols)} NSE EQ-series stocks in universe")
 
 prices = download_prices(tuple(symbols))
@@ -279,41 +241,45 @@ d2.download_button("Download TradingView watchlist (.txt)", tv_list,
 with st.expander("Or copy symbols for TradingView"):
     st.code(tv_list, language=None)
 
-tab_grid, tab_one = st.tabs(["TradingView chart grid (all matches)", "Single stock chart"])
+def tv_link(sym):
+    return f"https://www.tradingview.com/chart/?symbol={tv_symbol(sym)}"
+
+
+tab_grid, tab_one = st.tabs(["Chart grid (all matches)", "Single stock chart"])
 
 with tab_grid:
     if len(res) == 0:
         st.info("No stocks match the current band / filters.")
     else:
-        g1, g2, g3, g4 = st.columns(4)
-        per_page = g1.selectbox("Charts per page", [4, 6, 9, 12, 16], index=2)
-        tf_label = g2.selectbox("Timeframe", ["1D", "1W", "4h", "1h", "15m"])
-        tf = {"1D": "D", "1W": "W", "4h": "240", "1h": "60", "15m": "15"}[tf_label]
-        vp_on = g3.checkbox("Volume profile on charts", value=True)
+        g1, g2 = st.columns(2)
+        per_page = g1.selectbox("Charts per page", [4, 6, 9, 12], index=1)
         pages = max(1, -(-len(res) // per_page))
-        page = g4.number_input(f"Page (of {pages})", 1, pages, 1)
-        chunk = res["Symbol"].iloc[(page - 1) * per_page: page * per_page].tolist()
-        cols = 2 if per_page <= 4 else 3 if per_page <= 9 else 4
-        st.caption(f"Showing {len(chunk)} of {len(res)} matches, sorted closest to POC first. "
-                   "Changing the band or filters in the sidebar updates this list.")
-        tv_grid(chunk, tf, vp_on, cols)
+        page = g2.number_input(f"Page (of {pages})", 1, pages, 1)
+        chunk = res.iloc[(page - 1) * per_page: page * per_page]
+        ncols = 2 if per_page <= 4 else 3
+        st.caption(f"Showing {len(chunk)} of {len(res)} matches, closest to POC first. "
+                   "Red = POC · Blue = value area · Grey = outside value area.")
+        rows_ = list(chunk.itertuples(index=False))
+        for i in range(0, len(rows_), ncols):
+            cols = st.columns(ncols)
+            for col, r in zip(cols, rows_[i:i + ncols]):
+                with col:
+                    st.plotly_chart(
+                        make_chart(r.Symbol, prices[r.Symbol], int(lookback), int(bins), va_pct, height=360),
+                        use_container_width=True, key=f"grid_{r.Symbol}")
+                    st.markdown(f"**{r.Symbol}** · ₹{r.Close} · "
+                                f"[Open on TradingView ↗]({tv_link(r.Symbol)})")
 
 with tab_one:
     selected = event.selection.rows
     if selected and len(res):
-        sym = res.iloc[selected[0]]["Symbol"]
         row = res.iloc[selected[0]]
+        sym = row["Symbol"]
         st.subheader(f"{sym}  ·  Close ₹{row['Close']}  ·  POC ₹{row['POC']}  ·  {row[pct_col]}% vs {ref}")
-        view = st.radio("Chart", ["TradingView", "Built-in (with POC / value area)"], horizontal=True)
-        if view == "TradingView":
-            tv_widget(sym)
-            st.markdown(f"[Open full chart on TradingView ↗](https://www.tradingview.com/chart/?symbol={tv_symbol(sym)})")
-            st.caption(f"Draw the POC line (₹{row['POC']}) on TradingView, or switch to the built-in chart to see it automatically. "
-                       "If the volume profile isn't shown, add it via Indicators → 'Volume Profile Visible Range'.")
-        else:
-            st.plotly_chart(make_chart(sym, prices[sym], int(lookback), int(bins), va_pct),
-                            use_container_width=True)
-            st.caption("Red bar/line = POC · Blue = value area (VAH/VAL) · Grey = outside value area")
+        st.plotly_chart(make_chart(sym, prices[sym], int(lookback), int(bins), va_pct),
+                        use_container_width=True, key="single_chart")
+        st.markdown(f"[Open {sym} on TradingView ↗]({tv_link(sym)})")
+        st.caption("Red bar/line = POC · Blue = value area (VAH/VAL) · Grey = outside value area")
     else:
         st.info("Click a row in the table above to see the chart.")
 
