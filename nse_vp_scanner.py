@@ -113,7 +113,8 @@ def volume_profile(df: pd.DataFrame, lookback: int, bins: int, va_pct: float):
 
 
 @st.cache_data(show_spinner=False)
-def build_table(_prices: dict, key: int, lookback: int, bins: int, va_pct: float):
+def build_table(_prices: dict, key: int, lookback: int, bins: int, va_pct: float,
+                n_res: int = 20, k_sup: int = 5):
     rows = []
     for sym, df in _prices.items():
         vp = volume_profile(df, lookback, bins, va_pct)
@@ -128,6 +129,8 @@ def build_table(_prices: dict, key: int, lookback: int, bins: int, va_pct: float
             "VAL": round(vp["val"], 2),
             "AvgVol": int(d["Volume"].mean()),
             "AvgTurnover(Cr)": round((d["Close"] * d["Volume"]).mean() / 1e7, 2),
+            "Res1D": round(df["High"].iloc[-(n_res + 1):-1].max(), 2),   # highest high of prior N days
+            "MinCloseK": round(df["Close"].tail(k_sup).min(), 2),         # lowest close in last K days
         })
     return pd.DataFrame(rows)
 
@@ -180,6 +183,35 @@ def tv_symbol(sym: str) -> str:
 
 
 
+def _pick(data, t):
+    try:
+        return data[t]
+    except KeyError:
+        return data
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_15m_levels(symbols: tuple, bars: int, chunk: int = 50) -> dict:
+    """For each symbol: (latest 15m close, highest high of the previous `bars` 15m bars)."""
+    out = {}
+    for i in range(0, len(symbols), chunk):
+        batch = list(symbols[i:i + chunk])
+        tickers = [x + ".NS" for x in batch]
+        try:
+            data = yf.download(tickers, period="30d", interval="15m", group_by="ticker",
+                               auto_adjust=False, threads=True, progress=False)
+        except Exception:
+            continue
+        for x, t in zip(batch, tickers):
+            try:
+                d = _pick(data, t)[["High", "Close"]].dropna()
+                if len(d) > bars + 1:
+                    out[x] = (float(d["Close"].iloc[-1]), float(d["High"].iloc[-(bars + 1):-1].max()))
+            except Exception:
+                pass
+    return out
+
+
 # ------------------------------------------------------------------ UI
 st.title("NSE Volume Profile Scanner")
 
@@ -201,6 +233,19 @@ with st.sidebar:
     min_price = st.number_input("Min price (₹)", 0.0, value=20.0)
     min_turnover = st.number_input("Min avg daily turnover (₹ Cr)", 0.0, value=1.0)
 
+    st.subheader("Support / resistance filters")
+    use_d_res = st.checkbox("Price above 1D resistance", value=False,
+                            help="Latest close > highest high of the previous N daily candles.")
+    n_res = st.number_input("1D resistance: highest high of last N days", 5, 100, 20, 5)
+    use_sup = st.checkbox("Support held at POC", value=False,
+                          help="No daily close below POC (minus tolerance) in the last K days.")
+    k_sup = st.number_input("Support check: last K days", 1, 60, 5)
+    sup_tol = st.number_input("Support tolerance (% below POC)", 0.0, 5.0, 1.0, 0.5)
+    use_15 = st.checkbox("Price above 15-min resistance", value=False,
+                         help="Latest 15-min close > highest high of the previous N 15-min bars. "
+                              "Checked only on stocks that pass the other filters.")
+    bars15 = st.number_input("15-min resistance: last N bars (26 bars ≈ 1 day)", 10, 500, 100, 10)
+
     if st.button("Refresh data"):
         st.cache_data.clear()
         st.rerun()
@@ -214,7 +259,7 @@ except RuntimeError:
 st.caption(f"{len(symbols)} NSE EQ-series stocks in universe")
 
 prices = download_prices(tuple(symbols))
-table = build_table(prices, len(prices), int(lookback), int(bins), va_pct)
+table = build_table(prices, len(prices), int(lookback), int(bins), va_pct, int(n_res), int(k_sup))
 
 pct_col = "% vs " + ref
 table[pct_col] = ((table["Close"] - table[ref]) / table[ref] * 100).round(2)
@@ -224,6 +269,25 @@ res = table[
     & (table["Close"] >= min_price)
     & (table["AvgTurnover(Cr)"] >= min_turnover)
 ].sort_values(pct_col).reset_index(drop=True)
+
+
+# ---- support / resistance filters
+if use_d_res:
+    res = res[res["Close"] > res["Res1D"]]
+if use_sup:
+    res = res[res["MinCloseK"] >= res["POC"] * (1 - sup_tol / 100)]
+res = res.reset_index(drop=True)
+
+if use_15 and len(res):
+    if len(res) > 300:
+        st.warning(f"{len(res)} stocks passed the other filters; checking 15-min data for the 300 closest "
+                   "to POC only. Narrow the band or turn on other filters to cover all.")
+        res = res.head(300)
+    with st.spinner("Checking 15-minute resistance..."):
+        lv = get_15m_levels(tuple(res["Symbol"]), int(bars15))
+    res["Close15m"] = res["Symbol"].map(lambda x: lv.get(x, (np.nan, np.nan))[0]).round(2)
+    res["Res15m"] = res["Symbol"].map(lambda x: lv.get(x, (np.nan, np.nan))[1]).round(2)
+    res = res[res["Close15m"] > res["Res15m"]].reset_index(drop=True)
 
 c1, c2, c3 = st.columns(3)
 c1.metric("Stocks scanned", len(table))
