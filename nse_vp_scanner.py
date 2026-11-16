@@ -58,6 +58,11 @@ def get_nse_symbols(series: tuple) -> list[str]:
     return sorted(df[df["SERIES"].isin(series)]["SYMBOL"].unique().tolist())
 
 
+def yf_ticker(sym: str) -> str:
+    """NSE symbols get .NS; entries that already contain a dot (e.g. 512399.BO) are used as-is."""
+    return sym if "." in sym else sym + ".NS"
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def download_prices(symbols: tuple, chunk: int = 100) -> dict:
     """Daily OHLCV for every symbol (~9 months so 100+ trading days exist)."""
@@ -65,7 +70,7 @@ def download_prices(symbols: tuple, chunk: int = 100) -> dict:
     prog = st.progress(0.0, text="Downloading price data...")
     for i in range(0, len(symbols), chunk):
         batch = list(symbols[i:i + chunk])
-        tickers = [s + ".NS" for s in batch]
+        tickers = [yf_ticker(s) for s in batch]
         try:
             data = yf.download(
                 tickers, period="9mo", interval="1d", group_by="ticker",
@@ -186,6 +191,8 @@ def make_chart(sym: str, df: pd.DataFrame, lookback: int, bins: int, va_pct: flo
 
 # ---------------------------------------------------- TradingView
 def tv_symbol(sym: str) -> str:
+    if sym.endswith(".BO"):
+        return "BSE:" + sym[:-3]
     # TradingView writes hyphens as underscores (BAJAJ-AUTO -> BAJAJ_AUTO)
     return "NSE:" + sym.replace("-", "_").replace("&", "_")
 
@@ -204,7 +211,7 @@ def get_15m_levels(symbols: tuple, bars: int, chunk: int = 50) -> dict:
     out = {}
     for i in range(0, len(symbols), chunk):
         batch = list(symbols[i:i + chunk])
-        tickers = [x + ".NS" for x in batch]
+        tickers = [yf_ticker(x) for x in batch]
         try:
             data = yf.download(tickers, period="30d", interval="15m", group_by="ticker",
                                auto_adjust=False, threads=True, progress=False)
@@ -228,6 +235,10 @@ with st.sidebar:
     series_sel = st.multiselect("NSE series to include", ["EQ", "BE", "BZ", "SM", "ST"], default=["EQ"],
                                 help="EQ = normal stocks. BE/BZ = trade-for-trade or surveillance stocks. "
                                 "SM/ST = SME platform. Adding series means a bigger (slower) download.")
+    extra_txt = st.text_area(
+        "Extra stocks to scan (comma-separated)", value="",
+        help="Add stocks missing from the NSE list. BSE-only stocks: BSE code + .BO, e.g. 512399.BO. "
+             "NSE stocks: just the symbol, e.g. SERA.")
     lookback = st.number_input("Volume profile lookback (trading days)", 20, 250, 100, 5)
     bins = st.number_input("Price bins", 20, 200, 60, 10)
     ref_label = st.selectbox(
@@ -264,6 +275,14 @@ with st.sidebar:
 try:
     full_list = load_list()
     symbols = get_nse_symbols(tuple(series_sel or ['EQ']))
+    extra_list = []
+    for t in extra_txt.replace("\n", ",").split(","):
+        t = t.strip().upper()
+        if t.endswith(".NS"):
+            t = t[:-3]
+        if t:
+            extra_list.append(t)
+    symbols = sorted(set(symbols) | set(extra_list))
 except RuntimeError:
     st.error("Could not load the NSE stock list. Upload 'EQUITY_L.csv' (from "
              "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv) to the app's GitHub repository.")
@@ -362,48 +381,51 @@ with tab_one:
 
 
 with st.expander("Why isn't a stock showing? (diagnose)"):
-    q = st.text_input("NSE symbol or part of the name (e.g. SERA)").strip().upper()
+    q = st.text_input("NSE symbol, BSE code with .BO (e.g. 512399.BO), or part of the name").strip().upper()
     if q:
         fl = full_list
         hits = fl[fl["SYMBOL"].str.upper().str.contains(q, regex=False)
                   | fl["NAME OF COMPANY"].astype(str).str.upper().str.contains(q, regex=False)]
-        if hits.empty:
-            st.error("Not found in the NSE equity list file at all: wrong symbol, a very recent listing, "
-                     "or the EQUITY_L.csv copy in the repository is out of date.")
-        else:
-            st.write("Matches in the NSE list:")
-            st.dataframe(hits.head(15), use_container_width=True, hide_index=True)
-            exact = hits[hits["SYMBOL"].str.upper() == q]
-            if exact.empty:
-                st.info("Type the exact symbol from the table above to run the full check.")
+        custom = q in set(extra_list)
+        if not custom:
+            if hits.empty:
+                st.error("Not found in the NSE equity list file. It may be listed only on BSE, be a very recent "
+                         "listing, or the EQUITY_L.csv copy in the repository is old. For a BSE-only stock, add "
+                         "its BSE code with .BO (e.g. 512399.BO) to 'Extra stocks to scan' in the sidebar.")
             else:
-                ser = exact.iloc[0]["SERIES"]
-                if ser not in (series_sel or ["EQ"]):
-                    st.warning(f"{q} is in series **{ser}**, which is not selected. Add it under "
-                               "'NSE series to include' in the sidebar.")
-                elif q not in prices:
-                    st.warning("No price data came back from Yahoo Finance for this symbol "
-                               "(not listed there, delisted, or the download was throttled). Try Refresh data.")
-                elif q not in set(table["Symbol"]):
-                    st.warning(f"Fewer than {int(lookback * 0.8)} trading days of history, "
-                               f"so a {int(lookback)}-day profile can't be built.")
-                else:
-                    r = table[table["Symbol"] == q].iloc[0]
-                    checks = [
-                        (f"{pct_col} within {band[0]}% to {band[1]}%", band[0] <= r[pct_col] <= band[1], f"{r[pct_col]}%"),
-                        (f"Price >= {min_price}", r["Close"] >= min_price, f"{r['Close']}"),
-                        (f"Avg turnover >= {min_turnover} Cr", r["AvgTurnover(Cr)"] >= min_turnover, f"{r['AvgTurnover(Cr)']} Cr"),
-                    ]
-                    if use_d_res:
-                        checks.append(("Close above 1D resistance", r["Close"] > r["Res1D"], f"close {r['Close']} vs resistance {r['Res1D']}"))
-                    if use_sup:
-                        checks.append(("Support held at POC", r["MinCloseK"] >= r["POC"] * (1 - sup_tol / 100),
-                                       f"lowest close {r['MinCloseK']} vs POC {r['POC']}"))
-                    st.write(f"**{q}**: close {r['Close']}, POC {r['POC']}, VAH {r['VAH']}, VAL {r['VAL']}")
-                    for label, ok, detail in checks:
-                        st.write(("✅ " if ok else "❌ ") + f"{label}  ({detail})")
-                    if use_15:
-                        st.caption("The 15-minute check is not shown here; it runs only on stocks that pass the other filters.")
+                st.write("Matches in the NSE list:")
+                st.dataframe(hits.head(15), use_container_width=True, hide_index=True)
+        exact = hits[hits["SYMBOL"].str.upper() == q]
+        if custom or not exact.empty:
+            ser = "extra" if custom else exact.iloc[0]["SERIES"]
+            if not custom and ser not in (series_sel or ["EQ"]):
+                st.warning(f"{q} is in series **{ser}**, which is not selected. Add it under "
+                           "'NSE series to include' in the sidebar.")
+            elif q not in prices:
+                st.warning("No price data came back from Yahoo Finance for this symbol "
+                           "(not listed there, delisted, or the download was throttled). Try Refresh data.")
+            elif q not in set(table["Symbol"]):
+                st.warning(f"Fewer than {int(lookback * 0.8)} trading days of history, "
+                           f"so a {int(lookback)}-day profile can't be built.")
+            else:
+                r = table[table["Symbol"] == q].iloc[0]
+                checks = [
+                    (f"{pct_col} within {band[0]}% to {band[1]}%", band[0] <= r[pct_col] <= band[1], f"{r[pct_col]}%"),
+                    (f"Price >= {min_price}", r["Close"] >= min_price, f"{r['Close']}"),
+                    (f"Avg turnover >= {min_turnover} Cr", r["AvgTurnover(Cr)"] >= min_turnover, f"{r['AvgTurnover(Cr)']} Cr"),
+                ]
+                if use_d_res:
+                    checks.append(("Close above 1D resistance", r["Close"] > r["Res1D"], f"close {r['Close']} vs resistance {r['Res1D']}"))
+                if use_sup:
+                    checks.append(("Support held at POC", r["MinCloseK"] >= r["POC"] * (1 - sup_tol / 100),
+                                   f"lowest close {r['MinCloseK']} vs POC {r['POC']}"))
+                st.write(f"**{q}**: close {r['Close']}, POC {r['POC']}, VAH {r['VAH']}, VAL {r['VAL']}")
+                for label, ok, detail in checks:
+                    st.write(("✅ " if ok else "❌ ") + f"{label}  ({detail})")
+                if use_15:
+                    st.caption("The 15-minute check is not shown here; it runs only on stocks that pass the other filters.")
+        elif not hits.empty:
+            st.info("Type the exact symbol from the table above to run the full check.")
 
 st.caption(
     "Profile is built from daily bars (volume spread across each day's high–low range), "
