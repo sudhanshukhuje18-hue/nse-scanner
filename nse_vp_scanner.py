@@ -28,26 +28,34 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 LOCAL_LIST = Path(__file__).parent / "EQUITY_L.csv"
 
 
-def _parse_symbols(df: pd.DataFrame) -> list[str]:
+def _clean_list(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip() for c in df.columns]
-    df = df[df["SERIES"].astype(str).str.strip() == "EQ"]
-    return sorted(df["SYMBOL"].astype(str).str.strip().unique().tolist())
+    df["SYMBOL"] = df["SYMBOL"].astype(str).str.strip()
+    df["SERIES"] = df["SERIES"].astype(str).str.strip()
+    if "NAME OF COMPANY" not in df.columns:
+        df["NAME OF COMPANY"] = ""
+    return df[["SYMBOL", "NAME OF COMPANY", "SERIES"]]
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def get_nse_symbols() -> list[str]:
+def load_list() -> pd.DataFrame:
     """Try NSE live; if NSE blocks us (common on cloud servers), use EQUITY_L.csv from the repo."""
     try:
         sess = requests.Session()
         sess.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com/"})
         r = sess.get(NSE_LIST_URL, timeout=10)
         r.raise_for_status()
-        return _parse_symbols(pd.read_csv(io.StringIO(r.text)))
+        return _clean_list(pd.read_csv(io.StringIO(r.text)))
     except Exception:
         pass
     if LOCAL_LIST.exists():
-        return _parse_symbols(pd.read_csv(LOCAL_LIST))
+        return _clean_list(pd.read_csv(LOCAL_LIST))
     raise RuntimeError("NO_LIST")
+
+
+def get_nse_symbols(series: tuple) -> list[str]:
+    df = load_list()
+    return sorted(df[df["SERIES"].isin(series)]["SYMBOL"].unique().tolist())
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -217,6 +225,9 @@ st.title("NSE Volume Profile Scanner")
 
 with st.sidebar:
     st.header("Settings")
+    series_sel = st.multiselect("NSE series to include", ["EQ", "BE", "BZ", "SM", "ST"], default=["EQ"],
+                                help="EQ = normal stocks. BE/BZ = trade-for-trade or surveillance stocks. "
+                                "SM/ST = SME platform. Adding series means a bigger (slower) download.")
     lookback = st.number_input("Volume profile lookback (trading days)", 20, 250, 100, 5)
     bins = st.number_input("Price bins", 20, 200, 60, 10)
     ref_label = st.selectbox(
@@ -251,12 +262,13 @@ with st.sidebar:
         st.rerun()
 
 try:
-    symbols = get_nse_symbols()
+    full_list = load_list()
+    symbols = get_nse_symbols(tuple(series_sel or ['EQ']))
 except RuntimeError:
     st.error("Could not load the NSE stock list. Upload 'EQUITY_L.csv' (from "
              "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv) to the app's GitHub repository.")
     st.stop()
-st.caption(f"{len(symbols)} NSE EQ-series stocks in universe")
+st.caption(f"{len(symbols)} NSE stocks in universe (series: {', '.join(series_sel or ['EQ'])})")
 
 prices = download_prices(tuple(symbols))
 table = build_table(prices, len(prices), int(lookback), int(bins), va_pct, int(n_res), int(k_sup))
@@ -347,6 +359,51 @@ with tab_one:
     else:
         st.info("Click a row in the table above to see the chart.")
 
+
+
+with st.expander("Why isn't a stock showing? (diagnose)"):
+    q = st.text_input("NSE symbol or part of the name (e.g. SERA)").strip().upper()
+    if q:
+        fl = full_list
+        hits = fl[fl["SYMBOL"].str.upper().str.contains(q, regex=False)
+                  | fl["NAME OF COMPANY"].astype(str).str.upper().str.contains(q, regex=False)]
+        if hits.empty:
+            st.error("Not found in the NSE equity list file at all: wrong symbol, a very recent listing, "
+                     "or the EQUITY_L.csv copy in the repository is out of date.")
+        else:
+            st.write("Matches in the NSE list:")
+            st.dataframe(hits.head(15), use_container_width=True, hide_index=True)
+            exact = hits[hits["SYMBOL"].str.upper() == q]
+            if exact.empty:
+                st.info("Type the exact symbol from the table above to run the full check.")
+            else:
+                ser = exact.iloc[0]["SERIES"]
+                if ser not in (series_sel or ["EQ"]):
+                    st.warning(f"{q} is in series **{ser}**, which is not selected. Add it under "
+                               "'NSE series to include' in the sidebar.")
+                elif q not in prices:
+                    st.warning("No price data came back from Yahoo Finance for this symbol "
+                               "(not listed there, delisted, or the download was throttled). Try Refresh data.")
+                elif q not in set(table["Symbol"]):
+                    st.warning(f"Fewer than {int(lookback * 0.8)} trading days of history, "
+                               f"so a {int(lookback)}-day profile can't be built.")
+                else:
+                    r = table[table["Symbol"] == q].iloc[0]
+                    checks = [
+                        (f"{pct_col} within {band[0]}% to {band[1]}%", band[0] <= r[pct_col] <= band[1], f"{r[pct_col]}%"),
+                        (f"Price >= {min_price}", r["Close"] >= min_price, f"{r['Close']}"),
+                        (f"Avg turnover >= {min_turnover} Cr", r["AvgTurnover(Cr)"] >= min_turnover, f"{r['AvgTurnover(Cr)']} Cr"),
+                    ]
+                    if use_d_res:
+                        checks.append(("Close above 1D resistance", r["Close"] > r["Res1D"], f"close {r['Close']} vs resistance {r['Res1D']}"))
+                    if use_sup:
+                        checks.append(("Support held at POC", r["MinCloseK"] >= r["POC"] * (1 - sup_tol / 100),
+                                       f"lowest close {r['MinCloseK']} vs POC {r['POC']}"))
+                    st.write(f"**{q}**: close {r['Close']}, POC {r['POC']}, VAH {r['VAH']}, VAL {r['VAL']}")
+                    for label, ok, detail in checks:
+                        st.write(("✅ " if ok else "❌ ") + f"{label}  ({detail})")
+                    if use_15:
+                        st.caption("The 15-minute check is not shown here; it runs only on stocks that pass the other filters.")
 
 st.caption(
     "Profile is built from daily bars (volume spread across each day's high–low range), "
