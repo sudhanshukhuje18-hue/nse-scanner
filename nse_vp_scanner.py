@@ -273,10 +273,12 @@ def read_custom_df(raw: str, name: str = "") -> pd.DataFrame:
 
 
 def read_bse_map(raw: str) -> dict:
-    """BSE 'List of scrips' CSV -> {Security Id: Security Code}."""
-    df = pd.read_csv(io.StringIO(raw.lstrip("\ufeff")))
+    """BSE 'List of scrips' or Bhavcopy CSV -> {ticker/Security Id: BSE code}."""
+    df = pd.read_csv(io.StringIO(raw.lstrip("\ufeff")), index_col=False)  # BSE rows carry trailing commas
     low = {str(c).strip().lower(): c for c in df.columns}
-    idc, cc = low.get("security id"), low.get("security code")
+    idc = next((low[k] for k in ("security id", "tckrsymb", "scrip id", "scrip_id", "symbol") if k in low), None)
+    cc = next((low[k] for k in ("security code", "fininstrmid", "sc_code", "scrip code", "scrip_cd", "code")
+               if k in low), None)
     if not idc or not cc:
         return {}
     codes = pd.to_numeric(df[cc], errors="coerce")
