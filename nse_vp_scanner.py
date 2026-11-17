@@ -9,6 +9,7 @@ Run:      streamlit run nse_vp_scanner.py
 """
 
 import io
+import re
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -227,6 +228,89 @@ def get_15m_levels(symbols: tuple, bars: int, chunk: int = 50) -> dict:
     return out
 
 
+MY_LIST_FILES = [Path(__file__).parent / "my_stocks.csv", Path(__file__).parent / "my_stocks.txt"]
+BSE_MAP_FILE = Path(__file__).parent / "bse_scrips.csv"
+
+
+def _split_sym(sym: str, ex: str = ""):
+    sym = sym.strip().upper()
+    if ":" in sym:
+        ex, sym = sym.split(":", 1)
+    sym = sym.strip()
+    if sym.endswith(".NS"):
+        sym = sym[:-3]
+    return sym, ex.strip().upper()
+
+
+def read_custom_df(raw: str, name: str = "") -> pd.DataFrame:
+    """CSV with a Symbol column (TradingView screener export works as-is), or a TradingView watchlist .txt.
+    Returns columns: sym, ex (exchange if known), turn (today's turnover in Cr, if Price & Volume columns exist)."""
+    raw = raw.lstrip("\ufeff")
+    rows = []
+    if name.lower().endswith(".csv"):
+        df = pd.read_csv(io.StringIO(raw))
+        df.columns = [str(c).strip() for c in df.columns]
+        low = {c.lower(): c for c in df.columns}
+        col = next((low[k] for k in ("symbol", "ticker", "scrip code", "security code", "code", "security id")
+                    if k in low), df.columns[0])
+        exc, pcol = low.get("exchange"), low.get("price")
+        vcol = next((c for c in df.columns if c.lower().startswith("volume")), None)
+        for i, v in df[col].dropna().items():
+            sym, ex = _split_sym(str(v), str(df.at[i, exc]) if exc else "")
+            turn = np.nan
+            if pcol and vcol:
+                turn = (pd.to_numeric(df.at[i, pcol], errors="coerce")
+                        * pd.to_numeric(df.at[i, vcol], errors="coerce") / 1e7)
+            rows.append((sym, ex, turn))
+    else:
+        for tok in re.split(r"[,\n\r\t ]+", raw):
+            if tok and not tok.startswith("#"):
+                sym, ex = _split_sym(tok)
+                rows.append((sym, ex, np.nan))
+    out = pd.DataFrame(rows, columns=["sym", "ex", "turn"])
+    out = out[(out["sym"] != "") & (out["sym"] != "NAN")]
+    return out.sort_values("turn", ascending=False).drop_duplicates("sym").reset_index(drop=True)
+
+
+def read_bse_map(raw: str) -> dict:
+    """BSE 'List of scrips' CSV -> {Security Id: Security Code}."""
+    df = pd.read_csv(io.StringIO(raw.lstrip("\ufeff")))
+    low = {str(c).strip().lower(): c for c in df.columns}
+    idc, cc = low.get("security id"), low.get("security code")
+    if not idc or not cc:
+        return {}
+    codes = pd.to_numeric(df[cc], errors="coerce")
+    out = {}
+    for sid, code in zip(df[idc].astype(str).str.strip().str.upper(), codes):
+        if code == code:
+            out[sid] = str(int(code))
+    return out
+
+
+BSE_API = ("https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
+           "?Group=&Scripcode=&industry=&segment=Equity&status=Active")
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_bse_map_live() -> dict:
+    """Best effort: BSE often blocks cloud servers. Returns {} if it does."""
+    try:
+        r = requests.get(BSE_API, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0", "Referer": "https://www.bseindia.com/",
+            "Origin": "https://www.bseindia.com"})
+        r.raise_for_status()
+        out = {}
+        for row in r.json():
+            low = {str(k).lower(): v for k, v in row.items()}
+            sid = low.get("scrip_id") or low.get("security id")
+            code = str(low.get("scrip_cd") or low.get("security code") or "").strip()
+            if sid and code.isdigit():
+                out[str(sid).strip().upper()] = code
+        return out if len(out) > 1000 else {}
+    except Exception:
+        return {}
+
+
 # ------------------------------------------------------------------ UI
 st.title("NSE Volume Profile Scanner")
 
@@ -239,6 +323,41 @@ with st.sidebar:
         "Extra stocks to scan (comma-separated)", value="",
         help="Add stocks missing from the NSE list. BSE-only stocks: BSE code + .BO, e.g. 512399.BO. "
              "NSE stocks: just the symbol, e.g. SERA.")
+    universe_mode = st.radio("Stock universe", ["NSE list", "NSE list + my list", "My list only"],
+                             index=1 if any(f.exists() for f in MY_LIST_FILES) else 0,
+                             help="'My list' = the file you upload below, or my_stocks.csv / my_stocks.txt in the repository.")
+    up = st.file_uploader("My stock list (.csv or .txt)", type=["csv", "txt"],
+                          help="CSV with a Symbol column (optional Exchange column), or a TradingView watchlist .txt. "
+                               "BSE stocks: use the 6-digit code, e.g. 512399.")
+    custom_df = pd.DataFrame(columns=["sym", "ex", "turn"])
+    try:
+        if up is not None:
+            custom_df = read_custom_df(up.getvalue().decode("utf-8", "ignore"), up.name)
+        else:
+            for f in MY_LIST_FILES:
+                if f.exists():
+                    custom_df = read_custom_df(f.read_text(encoding="utf-8", errors="ignore"), f.name)
+                    break
+    except Exception as e:
+        st.error(f"Could not read your list: {e}")
+    min_turn_pre = st.number_input(
+        "My list: skip stocks with today's turnover below (₹ Cr)", 0.0, value=0.2, step=0.1,
+        help="Uses Price × Volume from your CSV to skip dead stocks before downloading (much faster). Set 0 to scan all.")
+    bse_up = st.file_uploader("BSE scrip list (optional, .csv)", type=["csv"],
+                              help="BSE's 'List of scrips' file (columns Security Code, Security Id). "
+                                   "Lets the scanner find BSE-only stocks from your list. Or put it in the repo as bse_scrips.csv.")
+    bse_map = {}
+    try:
+        if bse_up is not None:
+            bse_map = read_bse_map(bse_up.getvalue().decode("utf-8", "ignore"))
+        elif BSE_MAP_FILE.exists():
+            bse_map = read_bse_map(BSE_MAP_FILE.read_text(encoding="utf-8", errors="ignore"))
+        else:
+            bse_map = load_bse_map_live()
+    except Exception as e:
+        st.error(f"Could not read the BSE list: {e}")
+    pin_extra = st.checkbox("Always show my extra stocks (even if they fail filters)", value=True,
+                            help="Shows them at the top with Passes = False so you can see their numbers.")
     lookback = st.number_input("Volume profile lookback (trading days)", 20, 250, 100, 5)
     bins = st.number_input("Price bins", 20, 200, 60, 10)
     ref_label = st.selectbox(
@@ -282,6 +401,36 @@ try:
             t = t[:-3]
         if t:
             extra_list.append(t)
+    # ---- resolve my list (TradingView names) to Yahoo tickers: NSE first, then BSE via scrip list
+    custom_syms, unresolved, skipped = [], [], 0
+    nse_all = set(full_list["SYMBOL"])
+    for r in custom_df.itertuples(index=False):
+        if r.turn == r.turn and r.turn < min_turn_pre:
+            skipped += 1
+            continue
+        t = r.sym
+        if t.endswith(".BO"):
+            custom_syms.append(t)
+        elif t.isdigit():
+            custom_syms.append(t + ".BO")
+        else:
+            hit = next((c for c in (t, t.replace("_", "-")) if c in nse_all), None)
+            if hit and r.ex != "BSE":
+                custom_syms.append(hit)
+            elif t in bse_map:
+                custom_syms.append(bse_map[t] + ".BO")
+            else:
+                unresolved.append(t)
+    if len(custom_df):
+        st.caption(f"My list: {len(custom_df)} symbols → {len(custom_syms)} to scan, "
+                   f"{skipped} skipped (low turnover), {len(unresolved)} not matched to NSE/BSE")
+        if unresolved:
+            with st.expander(f"{len(unresolved)} symbols not matched (add a BSE scrip list to resolve BSE-only ones)"):
+                st.write(", ".join(unresolved[:500]) + (" ..." if len(unresolved) > 500 else ""))
+    if universe_mode == "My list only":
+        symbols = []
+    if universe_mode != "NSE list":
+        symbols = list(symbols) + custom_syms
     symbols = sorted(set(symbols) | set(extra_list))
 except RuntimeError:
     st.error("Could not load the NSE stock list. Upload 'EQUITY_L.csv' (from "
@@ -320,9 +469,20 @@ if use_15 and len(res):
     res["Res15m"] = res["Symbol"].map(lambda x: lv.get(x, (np.nan, np.nan))[1]).round(2)
     res = res[res["Close15m"] > res["Res15m"]].reset_index(drop=True)
 
+res["Passes"] = True
+if pin_extra and extra_list:
+    in_table = set(table["Symbol"])
+    no_data = [x for x in extra_list if x not in in_table]
+    if no_data:
+        st.warning("No usable Yahoo data (or under 80 days of history) for: " + ", ".join(no_data))
+    missing = table[table["Symbol"].isin(extra_list) & ~table["Symbol"].isin(res["Symbol"])].copy()
+    if len(missing):
+        missing["Passes"] = False
+        res = pd.concat([missing, res], ignore_index=True)
+
 c1, c2, c3 = st.columns(3)
 c1.metric("Stocks scanned", len(table))
-c2.metric("Matches", len(res))
+c2.metric("Matches", int(res["Passes"].sum()))
 c3.metric("Band", f"{band[0]}% to {band[1]}% above {ref}")
 
 st.subheader("Results  (click a row to open its chart)")
@@ -386,7 +546,7 @@ with st.expander("Why isn't a stock showing? (diagnose)"):
         fl = full_list
         hits = fl[fl["SYMBOL"].str.upper().str.contains(q, regex=False)
                   | fl["NAME OF COMPANY"].astype(str).str.upper().str.contains(q, regex=False)]
-        custom = q in set(extra_list)
+        custom = q in (set(extra_list) | set(custom_syms))
         if not custom:
             if hits.empty:
                 st.error("Not found in the NSE equity list file. It may be listed only on BSE, be a very recent "
